@@ -4,14 +4,11 @@ package main
 
 import (
 	"encoding/xml"
-	"errors"
 	"fmt"
 	"io"
 	"os"
 
 	"github.com/urfave/cli"
-	"gopkg.in/yaml.v3"
-	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	k8sfield "k8s.io/apimachinery/pkg/util/validation/field"
 	"k8s.io/kubectl/pkg/scheme"
@@ -26,17 +23,12 @@ import (
 
 func main() {
 	app := &cli.App{
+		Name:  "kubevirt2libvirt",
 		Usage: "Convert KubeVirt YAML into libvirt XML",
 		Flags: []cli.Flag{
-			&cli.StringFlag{
-				Name: "preferences",
-			},
-			&cli.StringFlag{
-				Name: "instancetypes",
-			},
-			&cli.StringFlag{
-				Name: "cpuset",
-			},
+			&cli.StringFlag{Name: "cpuset"},
+			&cli.StringFlag{Name: "preferences"},
+			&cli.StringFlag{Name: "instancetypes"},
 		},
 		Action: cli.ActionFunc(run),
 	}
@@ -47,10 +39,26 @@ func main() {
 	}
 }
 
-func run(c *cli.Context) error {
-	err := instancetypev1beta1.AddToScheme(scheme.Scheme)
-	if err != nil {
-		return err
+type options struct {
+	cpuSet             []int
+	knownPreferences   map[string]*instancetypev1beta1.VirtualMachinePreferenceSpec
+	knownInstancetypes map[string]*instancetypev1beta1.VirtualMachineInstancetypeSpec
+}
+
+func parseOptions(c *cli.Context) (*options, error) {
+	opts := &options{
+		cpuSet:             []int{},
+		knownPreferences:   map[string]*instancetypev1beta1.VirtualMachinePreferenceSpec{},
+		knownInstancetypes: map[string]*instancetypev1beta1.VirtualMachineInstancetypeSpec{},
+	}
+
+	if cpuSetString := c.String("cpuset"); cpuSetString != "" {
+		parsed, err := cpuset.Parse(c.Args().Get(0))
+		if err != nil {
+			return nil, err
+		}
+
+		opts.cpuSet = parsed.List()
 	}
 
 	if file := c.String("preferences"); file != "" {
@@ -59,15 +67,15 @@ func run(c *cli.Context) error {
 			instancetypev1beta1.SchemeGroupVersion.WithKind("VirtualMachineClusterPreference"),
 		})
 		if err != nil {
-			return err
+			return nil, err
 		}
 
 		for _, obj := range objs {
 			if preference, ok := obj.(*instancetypev1beta1.VirtualMachinePreference); ok {
-				knownPreferences[preference.Name] = &preference.Spec
+				opts.knownPreferences[preference.Name] = &preference.Spec
 			} else {
 				preference := obj.(*instancetypev1beta1.VirtualMachineClusterPreference)
-				knownPreferences[preference.Name] = &preference.Spec
+				opts.knownPreferences[preference.Name] = &preference.Spec
 			}
 		}
 	}
@@ -78,99 +86,67 @@ func run(c *cli.Context) error {
 			instancetypev1beta1.SchemeGroupVersion.WithKind("VirtualMachineClusterInstancetype"),
 		})
 		if err != nil {
-			return err
+			return nil, err
 		}
 
 		for _, obj := range objs {
 			if instancetype, ok := obj.(*instancetypev1beta1.VirtualMachineInstancetype); ok {
-				knownInstancetypes[instancetype.Name] = &instancetype.Spec
+				opts.knownInstancetypes[instancetype.Name] = &instancetype.Spec
 			} else {
 				instancetype := obj.(*instancetypev1beta1.VirtualMachineClusterInstancetype)
-				knownInstancetypes[instancetype.Name] = &instancetype.Spec
+				opts.knownInstancetypes[instancetype.Name] = &instancetype.Spec
 			}
 		}
 	}
 
-	var cpuSet []int
-	if cpuSetString := c.String("cpuset"); cpuSetString != "" {
-		parsed, err := cpuset.Parse(c.Args().Get(0))
-		if err != nil {
-			return err
-		}
-
-		cpuSet = parsed.List()
-	}
-
-	return convert(cpuSet)
+	return opts, nil
 }
 
-func decodeObjects(path string, allowedGvks []schema.GroupVersionKind) ([]runtime.Object, error) {
-	file, err := os.Open(path)
+func run(c *cli.Context) error {
+	opts, err := parseOptions(c)
+	if err != nil {
+		return err
+	}
+
+	yaml, err := io.ReadAll(os.Stdin)
+	if err != nil {
+		return err
+	}
+
+	xml, err := convert(yaml, opts)
+	if err != nil {
+		return err
+	}
+
+	fmt.Printf("%s\n", xml)
+
+	return nil
+}
+
+func convert(yaml []byte, opts *options) ([]byte, error) {
+	// unmarshal VM
+
+	obj, gvk, err := scheme.Codecs.UniversalDeserializer().Decode(yaml, nil, nil)
 	if err != nil {
 		return nil, err
 	}
-	defer file.Close()
 
-	var objects []runtime.Object
-	decoder := yaml.NewDecoder(file)
+	var vm *virtv1.VirtualMachine
 
-	for {
-		var node yaml.Node
-		err := decoder.Decode(&node)
-		if err != nil {
-			if errors.Is(err, io.EOF) {
-				break
-			} else {
-				return nil, err
-			}
+	switch *gvk {
+	case virtv1.VirtualMachineGroupVersionKind:
+		vm = obj.(*virtv1.VirtualMachine)
+	case virtv1.VirtualMachineInstanceGroupVersionKind:
+		vmi := obj.(*virtv1.VirtualMachineInstance)
+		vm = &virtv1.VirtualMachine{
+			Spec: virtv1.VirtualMachineSpec{
+				Template: &virtv1.VirtualMachineInstanceTemplateSpec{
+					Spec: vmi.Spec,
+				},
+			},
 		}
-
-		content, err := yaml.Marshal(&node)
-		if err != nil {
-			return nil, err
-		}
-
-		obj, gvk, err := scheme.Codecs.UniversalDeserializer().Decode(content, nil, nil)
-		if err != nil {
-			return nil, err
-		}
-
-		if !contains(allowedGvks, *gvk) {
-			return nil, fmt.Errorf("unexpected kind")
-		}
-
-		objects = append(objects, obj)
-	}
-
-	return objects, nil
-}
-
-func contains[T comparable](slice []T, elem T) bool {
-	for _, e := range slice {
-		if e == elem {
-			return true
-		}
-	}
-	return false
-}
-
-var knownPreferences = map[string]*instancetypev1beta1.VirtualMachinePreferenceSpec{}
-var knownInstancetypes = map[string]*instancetypev1beta1.VirtualMachineInstancetypeSpec{}
-
-func convert(cpuSet []int) error {
-	// read YAML from stdin
-
-	vmYaml, err := io.ReadAll(os.Stdin)
-	if err != nil {
-		return err
-	}
-
-	// unmarshal VM
-
-	vm := &virtv1.VirtualMachine{}
-	err = yaml.Unmarshal(vmYaml, vm)
-	if err != nil {
-		return err
+	default:
+		return nil, fmt.Errorf("unsupported object %s", gvk)
 	}
 
 	// look up preference and instancetype
@@ -180,15 +156,15 @@ func convert(cpuSet []int) error {
 
 	if vm.Spec.Preference != nil {
 		var ok bool
-		if preferenceSpec, ok = knownPreferences[vm.Spec.Preference.Name]; !ok {
-			return fmt.Errorf("unknown %s \"%s\"", vm.Spec.Preference.Kind, vm.Spec.Preference.Name)
+		if preferenceSpec, ok = opts.knownPreferences[vm.Spec.Preference.Name]; !ok {
+			return nil, fmt.Errorf("unknown %s \"%s\"", vm.Spec.Preference.Kind, vm.Spec.Preference.Name)
 		}
 	}
 
 	if vm.Spec.Instancetype != nil {
 		var ok bool
-		if instancetypeSpec, ok = knownInstancetypes[vm.Spec.Instancetype.Name]; !ok {
-			return fmt.Errorf("unknown %s \"%s\"", vm.Spec.Instancetype.Kind, vm.Spec.Instancetype.Name)
+		if instancetypeSpec, ok = opts.knownInstancetypes[vm.Spec.Instancetype.Name]; !ok {
+			return nil, fmt.Errorf("unknown %s \"%s\"", vm.Spec.Instancetype.Kind, vm.Spec.Instancetype.Name)
 		}
 	}
 
@@ -216,18 +192,18 @@ func convert(cpuSet []int) error {
 		k8sfield.NewPath("spec", "template", "spec"),
 		instancetypeSpec, preferenceSpec, &vmi.Spec, &vmi.ObjectMeta)
 	if len(conflicts) > 0 {
-		return fmt.Errorf("instancetype conflicts: %+v", conflicts)
+		return nil, fmt.Errorf("instancetype conflicts: %+v", conflicts)
 	}
 
 	// convert to domain
 
 	numaCell := &cmdv1.Cell{}
-	for _, cpu := range cpuSet {
+	for _, cpu := range opts.cpuSet {
 		numaCell.Cpus = append(numaCell.Cpus, &cmdv1.CPU{Id: uint32(cpu)})
 	}
 
 	context := &converter.ConverterContext{
-		CPUSet:           cpuSet,
+		CPUSet:           opts.cpuSet,
 		VirtualMachine:   vmi,
 		EFIConfiguration: &converter.EFIConfiguration{},
 		Topology: &cmdv1.Topology{
@@ -238,18 +214,15 @@ func convert(cpuSet []int) error {
 	domain := &api.Domain{}
 	err = converter.Convert_v1_VirtualMachineInstance_To_api_Domain(vmi, domain, context)
 	if err != nil {
-		return err
+		return nil, err
 	}
 
 	// marshal domain
 
-	domainXml, err := xml.MarshalIndent(domain.Spec, "", "  ")
-	if err != nil {
-		return err
-	}
+	return xml.MarshalIndent(domain.Spec, "", "  ")
+}
 
-	// write XML to stdout
-
-	fmt.Printf("%s\n", domainXml)
-	return nil
+func init() {
+	virtv1.AddToScheme(scheme.Scheme)
+	instancetypev1beta1.AddToScheme(scheme.Scheme)
 }

@@ -18,3 +18,7 @@ fmt:
 lint:
 	gofmt -l .
 	go vet ./...
+
+.PHONY: test
+test:
+	go test -v ./...

@@ -1,0 +1,44 @@
+<domain type="">
+  <name>_</name>
+  <memory unit="b">0</memory>
+  <os>
+    <type></type>
+  </os>
+  <sysinfo type="">
+    <system></system>
+    <bios></bios>
+    <baseBoard></baseBoard>
+    <chassis></chassis>
+  </sysinfo>
+  <devices>
+    <channel type="unix">
+      <target name="org.qemu.guest_agent.0" type="virtio"></target>
+    </channel>
+    <controller type="usb" index="0" model="qemu-xhci"></controller>
+    <controller type="scsi" index="0" model="virtio-non-transitional"></controller>
+    <controller type="virtio-serial" index="0" model="virtio-non-transitional"></controller>
+    <video>
+      <model type="vga" heads="1" vram="16384"></model>
+    </video>
+    <graphics type="vnc">
+      <listen type="socket" socket="/var/run/kubevirt-private//virt-vnc"></listen>
+    </graphics>
+    <memballoon model="virtio-non-transitional" freePageReporting="off"></memballoon>
+    <serial type="unix">
+      <target port="0"></target>
+      <source mode="bind" path="/var/run/kubevirt-private//virt-serial0"></source>
+    </serial>
+    <console type="pty">
+      <target type="serial" port="0"></target>
+    </console>
+  </devices>
+  <metadata>
+    <kubevirt xmlns="http://kubevirt.io">
+      <uid></uid>
+    </kubevirt>
+  </metadata>
+  <cpu mode="host-model">
+    <topology sockets="1" cores="1" threads="1"></topology>
+  </cpu>
+  <vcpu placement="static">1</vcpu>
+</domain>
